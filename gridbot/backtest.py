@@ -23,6 +23,7 @@ class Result:
     base: float
     quote: float
     halted: bool
+    bars: int  # K 線根數
 
 
 def candle_path(o: float, h: float, l: float, c: float) -> List[float]:
@@ -35,12 +36,16 @@ def run_backtest(cfg: GridConfig, candles: List[Candle]) -> Result:
     eng = GridEngine(cfg, first[1], first[0])
     peak = cfg.invest
     max_dd = 0.0
+    prev_close = None
     for ts, o, h, l, c in candles:
+        if prev_close is not None and o != prev_close:
+            eng.on_price(o, ts, gap=True)  # 上一根收盤到這根開盤之間沒有成交(缺資料 / 跳空)
         for p in candle_path(o, h, l, c)[1:]:
             eng.on_price(p, ts)
             eq = eng.equity(p)
             peak = max(peak, eq)
             max_dd = max(max_dd, (peak - eq) / peak)
+        prev_close = c
     end = candles[-1][4]
     eq = eng.equity(end)
     return Result(
@@ -52,10 +57,11 @@ def run_backtest(cfg: GridConfig, candles: List[Candle]) -> Result:
         hold_pnl_pct=(end / first[1] - 1) * 100,
         max_drawdown_pct=max_dd * 100,
         buys=eng.buy_count,
-        sells=eng.sell_count,
+        sells=eng.cycles,
         cycles=eng.cycles,
         grid_profit=eng.grid_profit,
         base=eng.base,
         quote=eng.quote,
         halted=eng.halted,
+        bars=len(candles),
     )

@@ -4,6 +4,8 @@
 - 價格區間 [lower, upper] 切成 grids 格,共 grids+1 條價位線。
 - 啟動時:現價下方每條線掛買單,上方每條線掛賣單(現價所在處留一個空檔);賣單所需的幣以現價市價買入。
 - 買單在 level i 成交 -> 在 level i+1 掛賣單;賣單在 level i 成交 -> 在 level i-1 掛買單。
+- 成交採「穿價」:價格必須越過掛單價才算成交,剛好碰到不算(實際上碰價未必輪得到你的單)。
+- 停損:連續行情以停損價出場;跳空(gap=True,例如停機後接續、斷線恢復)則以當下價格出場。
 - 每格數量固定,資金預先依「所有買單 + 初始持倉」分配,保證不會透支。
 """
 from __future__ import annotations
@@ -12,7 +14,7 @@ import math
 from dataclasses import asdict, dataclass
 from typing import Dict, List, Optional
 
-EPS = 1e-12
+REL_TOL = 1e-9  # 資金 / 持倉足夠與否的相對容差(絕對容差在金額大時會被浮點誤差吃掉)
 STATE_VERSION = 1
 MAX_SAVED_FILLS = 1000  # 存檔只保留最近的成交紀錄;cycles / grid_profit 另存,不受影響
 
@@ -57,9 +59,27 @@ def build_levels(cfg: GridConfig) -> List[float]:
     n = cfg.grids
     if cfg.mode == "arithmetic":
         step = (cfg.upper - cfg.lower) / n
-        return [cfg.lower + step * i for i in range(n + 1)]
-    ratio = (cfg.upper / cfg.lower) ** (1.0 / n)
-    return [cfg.lower * ratio**i for i in range(n + 1)]
+        lv = [cfg.lower + step * i for i in range(n + 1)]
+    else:
+        ratio = (cfg.upper / cfg.lower) ** (1.0 / n)
+        lv = [cfg.lower * ratio**i for i in range(n + 1)]
+    lv[0], lv[-1] = cfg.lower, cfg.upper  # 端點不受浮點誤差影響
+    return lv
+
+
+def min_spacing(cfg: GridConfig) -> float:
+    """最小格距(比例,0.01 = 1%)。"""
+    lv = build_levels(cfg)
+    return min(lv[i + 1] / lv[i] - 1 for i in range(len(lv) - 1))
+
+
+def breakeven_spacing(fee_rate: float) -> float:
+    """一買一賣扣完雙邊手續費剛好打平的格距:p_sell*(1-f) = p_buy*(1+f) -> 2f/(1-f)。"""
+    return 2 * fee_rate / (1 - fee_rate)
+
+
+def spacing_covers_fees(cfg: GridConfig) -> bool:
+    return min_spacing(cfg) > breakeven_spacing(cfg.fee_rate)
 
 
 class GridEngine:
@@ -73,8 +93,7 @@ class GridEngine:
         self.halted = False
         self.fills: List[Fill] = []
         self.cycles = 0  # 已完成的「買->賣」套利次數
-        self.buy_count = 0  # 網格買單成交次數(不含初始建倉)
-        self.sell_count = 0
+        self.buy_count = 0  # 網格買單成交次數(不含初始建倉);賣單成交次數即 cycles
         self.grid_profit = 0.0  # 網格套利利潤(估算,已扣手續費)
         # level index -> "buy" | "sell"
         self.orders: Dict[int, str] = {}
@@ -82,7 +101,7 @@ class GridEngine:
         fee = cfg.fee_rate
         # 現價所在的「空檔」:第一條 >= 現價的線不掛單,其下全掛買、其上全掛賣。
         # 如此任何時刻剛好 grids 張單,買單成交補在空檔的賣單、反之亦然,不會互相覆蓋。
-        gap = next(i for i, p in enumerate(self.levels) if p >= start_price)
+        gap = next((i for i, p in enumerate(self.levels) if p >= start_price), len(self.levels) - 1)
         buys = list(range(gap))
         sells = list(range(gap + 1, len(self.levels)))
         need_per_unit = (1 + fee) * (
@@ -121,15 +140,21 @@ class GridEngine:
         return (max(buys) if buys else None, min(sells) if sells else None)
 
     # ---- 驅動 ----
-    def on_price(self, price: float, ts: float = 0.0) -> List[Fill]:
-        """價格由 last_price 連續移動到 price,依序撮合途中被穿越的掛單。"""
+    def on_price(self, price: float, ts: float = 0.0, gap: bool = False) -> List[Fill]:
+        """價格由 last_price 移動到 price,依序撮合途中被穿越的掛單。
+
+        gap=False:視為連續行情(回測的 K 線路徑、即時串流)。
+        gap=True:中間有一段沒看到的走勢(停機、斷線)。網格限價單仍以掛單價成交
+        (真實交易所上掛著的限價單會照常撮合),但停損是程式監控的,只能以當下價格出場。
+        """
         if self.halted:
             return []
         new: List[Fill] = []
         last = self.last_price
-        if self.cfg.stop_loss is not None and price <= self.cfg.stop_loss:
-            new.extend(self._fill_range(last, self.cfg.stop_loss, ts))
-            new.append(self._stop_out(self.cfg.stop_loss, ts))
+        stop = self.cfg.stop_loss
+        if stop is not None and price <= stop:
+            new.extend(self._fill_range(last, stop, ts))
+            new.append(self._stop_out(price if gap else stop, ts))
             self.last_price = price
             return new
         new.extend(self._fill_range(last, price, ts))
@@ -140,31 +165,34 @@ class GridEngine:
         out: List[Fill] = []
         if price < last:
             idxs = sorted(
-                (i for i, s in self.orders.items() if s == "buy" and price <= self.levels[i] <= last),
+                (i for i, s in self.orders.items() if s == "buy" and price < self.levels[i] <= last),
                 reverse=True,
             )
             for i in idxs:
                 f = self._fill_buy(i, ts)
-                if f:
-                    out.append(f)
+                if f is None:
+                    break  # 跳過的單仍掛著;再往下撮合會覆蓋它,所以中止這一輪
+                out.append(f)
         elif price > last:
             idxs = sorted(
-                i for i, s in self.orders.items() if s == "sell" and last <= self.levels[i] <= price
+                i for i, s in self.orders.items() if s == "sell" and last <= self.levels[i] < price
             )
             for i in idxs:
                 f = self._fill_sell(i, ts)
-                if f:
-                    out.append(f)
+                if f is None:
+                    break
+                out.append(f)
         return out
 
     def _fill_buy(self, i: int, ts: float) -> Optional[Fill]:
         p = self.levels[i]
         cost = self.qty * p
         fee = cost * self.cfg.fee_rate
-        if self.quote + EPS < cost + fee:
+        need = cost + fee
+        if self.quote < need * (1 - REL_TOL):
             return None  # 資金不足(浮點誤差外不應發生)
         del self.orders[i]
-        self.quote -= cost + fee
+        self.quote = max(self.quote - need, 0.0)  # 容差內的微小負值歸零
         self.base += self.qty
         self.orders[i + 1] = "sell"
         f = Fill(ts, "buy", i, p, self.qty, fee)
@@ -174,7 +202,7 @@ class GridEngine:
 
     def _fill_sell(self, i: int, ts: float) -> Optional[Fill]:
         p = self.levels[i]
-        if self.base + EPS < self.qty:
+        if self.base < self.qty * (1 - REL_TOL):
             return None
         proceeds = self.qty * p
         fee = proceeds * self.cfg.fee_rate
@@ -185,7 +213,6 @@ class GridEngine:
         self.cycles += 1
         self.grid_profit += self.qty * (p - self.levels[i - 1]) - fee - self.qty * self.levels[i - 1] * self.cfg.fee_rate
         f = Fill(ts, "sell", i, p, self.qty, fee)
-        self.sell_count += 1
         self._record(f)
         return f
 
@@ -214,7 +241,6 @@ class GridEngine:
             "cycles": self.cycles,
             "grid_profit": self.grid_profit,
             "buy_count": self.buy_count,
-            "sell_count": self.sell_count,
             "orders": {str(i): s for i, s in self.orders.items()},
             "fills": [asdict(f) for f in self.fills[-MAX_SAVED_FILLS:]],
         }
@@ -238,7 +264,6 @@ class GridEngine:
             e.cycles = int(d["cycles"])
             e.grid_profit = float(d["grid_profit"])
             e.buy_count = int(d.get("buy_count", 0))
-            e.sell_count = int(d.get("sell_count", 0))
             e.orders = {int(i): s for i, s in d["orders"].items()}
             e.fills = [Fill(**f) for f in d["fills"]]
         except (KeyError, TypeError, AttributeError) as ex:

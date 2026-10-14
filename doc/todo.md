@@ -13,6 +13,7 @@
 - [x] 斷線警報與自動停機(Watchdog、心跳、--alert-cmd)
 - [ ] 內建 Telegram / Email 通知(目前靠 --alert-cmd 自行串接)
 - [ ] WebSocket 重連期間漏掉的價格,用 REST 近期成交/K 線補齊
+- [x] 深度 code review(26 項)全數修正
 - [ ] 回測輸出權益曲線 CSV / 圖表
 - [x] 參數掃描(格數、區間寬度、模式;樣本內 / 樣本外切分)
 - [x] 滾動視窗(walk-forward)驗證 `walkforward`

@@ -5,6 +5,41 @@ from gridbot.backtest import candle_path, run_backtest
 from gridbot.data import synthetic
 
 
+def _patch_price(**kw):
+    """同一個 mock 同時取代 cli(起始價)與 data(輪詢)的 fetch_price。"""
+    import contextlib
+    from unittest import mock
+    m = mock.Mock(**kw)
+    stack = contextlib.ExitStack()
+    stack.enter_context(mock.patch("gridbot.cli.fetch_price", m))
+    stack.enter_context(mock.patch("gridbot.data.fetch_price", m))
+    return stack, m
+
+
+class FakeTime:
+    """可控時鐘:sleep 只推進時間,不真的睡。同時取代 cli 與 data 的 time 模組。"""
+
+    def __init__(self):
+        import time as _t
+        self._t = _t
+        self.now = 1000.0
+
+    def monotonic(self):
+        return self.now
+
+    def time(self):
+        return 1.7e9 + self.now
+
+    def sleep(self, s):
+        self.now += s
+
+    def strftime(self, *a):
+        return self._t.strftime(*a)
+
+    def gmtime(self, *a):
+        return self._t.gmtime(*a)
+
+
 def cfg(**kw):
     base = dict(lower=90, upper=110, grids=4, invest=1000, fee_rate=0.0)
     base.update(kw)
@@ -231,13 +266,13 @@ class PersistenceTest(unittest.TestCase):
 
 class PaperCliTest(unittest.TestCase):
     ARGS = ["paper", "--symbol", "TESTUSDT", "--source", "poll", "--lower", "90", "--upper", "110", "--grids", "4",
-            "--invest", "1000", "--fee", "0", "--interval", "0"]
+            "--invest", "1000", "--fee", "0", "--interval", "0.5"]
 
     def _run(self, prices, path, extra=()):
         from unittest import mock
         from gridbot.cli import main
-        with mock.patch("gridbot.cli.fetch_price", side_effect=prices), \
-             mock.patch("gridbot.cli.time.sleep"):
+        stack, _ = _patch_price(side_effect=prices)
+        with stack, mock.patch("gridbot.data.time.sleep"):
             return main(self.ARGS + ["--state", path, "--max-polls", str(len(prices) - 1), *extra])
 
     def test_resume_and_guards(self):
@@ -261,7 +296,7 @@ class PaperCliTest(unittest.TestCase):
             with mock.patch("gridbot.cli.fetch_price", return_value=100.5), \
                  contextlib.redirect_stderr(io.StringIO()):
                 rc = main(self.ARGS[:-6] + ["--grids", "8", "--invest", "1000", "--fee", "0",
-                                            "--interval", "0", "--state", path, "--max-polls", "1"])
+                                            "--interval", "0.5", "--state", path, "--max-polls", "1"])
             self.assertEqual(rc, 2)
             # --reset -> 重新開始
             self.assertEqual(self._run([100.5, 100.5], path, ["--reset"]), 0)
@@ -303,11 +338,21 @@ class FakeWsServer:
         import base64, hashlib
         from gridbot.ws import GUID
         for script in self.scripts:
-            conn, _ = self.sock.accept()
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return  # 伺服器已關閉
             conn.settimeout(5)
             req = b""
-            while b"\r\n\r\n" not in req:
-                req += conn.recv(4096)
+            try:
+                while b"\r\n\r\n" not in req:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        raise OSError("客戶端在握手中途斷線")
+                    req += chunk
+            except OSError:
+                conn.close()
+                continue
             key = [l.split(b":")[1].strip() for l in req.split(b"\r\n") if l.lower().startswith(b"sec-websocket-key")][0]
             acc = base64.b64encode(hashlib.sha1(key + GUID.encode()).digest()).decode()
             if self.bad_accept:
@@ -355,6 +400,8 @@ class WebSocketTest(unittest.TestCase):
             srv.received.append(_read_client_frame(conn))  # 應回 close
 
         srv = FakeWsServer([script])
+
+        self.addCleanup(srv.close)
         ws = WebSocket(srv.url(), timeout=5)
         ws.connect()
         self.assertEqual(ws.recv(), "你好-ok")
@@ -370,6 +417,7 @@ class WebSocketTest(unittest.TestCase):
     def test_bad_handshake_rejected(self):
         from gridbot.ws import WebSocket, WebSocketError
         srv = FakeWsServer([lambda c, s: None], bad_accept=True)
+        self.addCleanup(srv.close)
         with self.assertRaises(WebSocketError):
             WebSocket(srv.url(), timeout=5).connect()
         srv.close()
@@ -381,10 +429,11 @@ class WebSocketTest(unittest.TestCase):
 
 
 def nxt(g):
-    """取下一個真正的價格,略過心跳 None。"""
+    """取下一個 Tick(價格),略過心跳 None 與 ALIVE。"""
+    from gridbot.data import Tick
     while True:
         v = next(g)
-        if v is not None:
+        if isinstance(v, Tick):
             return v
 
 
@@ -403,11 +452,22 @@ class StreamPricesTest(unittest.TestCase):
             conn.recv(1)  # 等到客戶端關閉
 
         srv = FakeWsServer([first, second])
+
+        self.addCleanup(srv.close)
         logs = []
         with mock.patch("gridbot.data.time.sleep") as sl:
             g = stream_prices("X", url=srv.url(), log=logs.append)
-            self.assertEqual(nxt(g), 100.5)
-            self.assertEqual(nxt(g), 101.25)  # 第一條連線被關 -> 重連 -> 第二條
+            alive = []
+            from gridbot.data import ALIVE, Tick
+            while True:  # 非成交訊息應以 ALIVE 回報(連線活著),不是被吞掉
+                v = next(g)
+                if v is ALIVE:
+                    alive.append(v)
+                if isinstance(v, Tick):
+                    break
+            self.assertEqual(len(alive), 2)
+            self.assertEqual(v, Tick(100.5, gap=True))  # 連線後第一筆:跳空
+            self.assertEqual(nxt(g), Tick(101.25, gap=True))  # 重連後第一筆:跳空
             g.close()
         sl.assert_called_once_with(1.0)
         self.assertTrue(any("重連" in m for m in logs))
@@ -418,6 +478,7 @@ class StreamPricesTest(unittest.TestCase):
         from gridbot.data import stream_prices
         from gridbot.ws import WebSocketError
         srv = FakeWsServer([])
+        self.addCleanup(srv.close)
         port = srv.port
         srv.close()  # 沒人監聽 -> 連線被拒
         with mock.patch("gridbot.data.time.sleep"):
@@ -461,18 +522,21 @@ class StreamIdleTest(unittest.TestCase):
             conn.recv(1)
 
         srv = FakeWsServer([silent, talks])
+
+        self.addCleanup(srv.close)
         logs = []
         g = stream_prices("X", url=srv.url(), idle_timeout=0.3, tick=0.05, log=logs.append)
         beats = 0
+        from gridbot.data import Tick
         with mock.patch("gridbot.data.time.sleep"):
             while True:
                 v = next(g)
                 if v is None:
                     beats += 1
-                else:
+                elif isinstance(v, Tick):
                     break
         g.close()
-        self.assertEqual(v, 7.0)
+        self.assertEqual(v.price, 7.0)
         self.assertGreater(beats, 3)  # 靜默期間持續送心跳
         self.assertTrue(any("沒有任何資料" in m for m in logs))
         srv.close()
@@ -491,8 +555,11 @@ class StreamIdleTest(unittest.TestCase):
                 pass  # 客戶端提早關閉
 
         srv = FakeWsServer([pings])
+
+        self.addCleanup(srv.close)
         g = stream_prices("X", url=srv.url(), idle_timeout=5, tick=0.05)
-        self.assertIsNone(next(g))  # ping 不該卡住迴圈,應立刻回到心跳
+        from gridbot.data import ALIVE
+        self.assertIn(next(g), (None, ALIVE))  # ping 不該卡住迴圈:回報「連線活著」或心跳
         g.close()
         srv.close()
 
@@ -511,16 +578,18 @@ class PaperStaleTest(unittest.TestCase):
                 return 100.5
             raise OSError("down")
 
+        ft = FakeTime()
         with tempfile.TemporaryDirectory() as t, contextlib.redirect_stdout(io.StringIO()) as out, \
                 contextlib.redirect_stderr(io.StringIO()):
             log = os.path.join(t, "alerts.txt")
-            with mock.patch("gridbot.cli.fetch_price", side_effect=price), \
-                 mock.patch("gridbot.cli.time.sleep"):
+            stack, _ = _patch_price(side_effect=price)
+            with stack, mock.patch("gridbot.cli.time", ft), mock.patch("gridbot.data.time", ft):
                 rc = main(PaperCliTest.ARGS + ["--state", os.path.join(t, "s.json"),
-                                               "--stale-warn", "0.05", "--stale-halt", "0.2",
+                                               "--stale-warn", "2", "--stale-halt", "4",
                                                "--alert-cmd", f'echo "$GRIDBOT_ALERT_LEVEL" >> {log}'])
             self.assertEqual(rc, 3)
-            self.assertEqual(open(log).read().split(), ["warn", "halt"])
+            with open(log) as fh:
+                self.assertCountEqual(fh.read().split(), ["warn", "halt"])  # 背景並行執行,順序不保證
             e, _ = load_state(os.path.join(t, "s.json"))
             self.assertFalse(e.halted)  # 只是停機,不是停損,重啟可接續
             self.assertIn("自動停機", out.getvalue())
@@ -546,6 +615,8 @@ class ReviewFixesTest(unittest.TestCase):
             conn.recv(1)
 
         srv = FakeWsServer([script])
+
+        self.addCleanup(srv.close)
         ws = WebSocket(srv.url(), timeout=5)
         ws.connect()
         got = [ws.recv(idle_return=True) for _ in range(2)]
@@ -562,9 +633,8 @@ class ReviewFixesTest(unittest.TestCase):
             e.on_price(109)
         self.assertLessEqual(len(e.fills), 2 * m.MAX_SAVED_FILLS)
         r = GridEngine.from_dict(e.to_dict())
-        self.assertEqual((r.buy_count, r.sell_count), (e.buy_count, e.sell_count))
+        self.assertEqual((r.buy_count, r.cycles), (e.buy_count, e.cycles))
         self.assertGreater(e.buy_count, m.MAX_SAVED_FILLS)  # 計數不受修剪影響
-        self.assertEqual(e.sell_count, e.cycles)
 
     # #3 狀態檔鎖
     def test_state_lock_exclusive(self):
@@ -583,9 +653,12 @@ class ReviewFixesTest(unittest.TestCase):
         import contextlib, io
         from gridbot.cli import main
         with contextlib.redirect_stderr(io.StringIO()) as err:
-            rc = main(PaperCliTest.ARGS[:-2] + ["--interval", "20"])
+            rc = main(PaperCliTest.ARGS[:-2] + ["--interval", "40"])  # >= 預設 stale-warn 30
         self.assertEqual(rc, 2)
         self.assertIn("stale-warn", err.getvalue())
+        for bad in ("0", "0.1"):  # 低於下限:會狂打 API
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(main(PaperCliTest.ARGS[:-2] + ["--interval", bad]), 2)
 
     # #2 接續時價格已跌破停損:清倉後直接結束,不進價格迴圈
     def test_resume_below_stop_loss_exits_immediately(self):
@@ -597,15 +670,17 @@ class ReviewFixesTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as t, contextlib.redirect_stdout(io.StringIO()) as out, \
                 contextlib.redirect_stderr(io.StringIO()):
             path = os.path.join(t, "s.json")
-            with mock.patch("gridbot.cli.fetch_price", side_effect=[100.5, 100.5]), \
-                 mock.patch("gridbot.cli.time.sleep"):
+            stack, _ = _patch_price(side_effect=[100.5, 100.5])
+            with stack, mock.patch("gridbot.data.time.sleep"):
                 self.assertEqual(main(args + ["--state", path, "--max-polls", "1"]), 0)
-            with mock.patch("gridbot.cli.fetch_price", side_effect=[70.0]) as fp:  # 只允許一次取價
+            stack, fp = _patch_price(side_effect=[70.0])  # 只允許一次取價
+            with stack:
                 self.assertEqual(main(args + ["--state", path]), 0)
-                self.assertEqual(fp.call_count, 1)
+            self.assertEqual(fp.call_count, 1)
             e, _ = load_state(path)
             self.assertTrue(e.halted)
             self.assertEqual(e.base, 0)
+            self.assertEqual(e.fills[-1].price, 70.0)  # 停機期間跌破:以現價而非停損價出場
             self.assertIn("停損", out.getvalue())
 
     # #4 退回輪詢後會再試 WebSocket
@@ -622,7 +697,7 @@ class ReviewFixesTest(unittest.TestCase):
                 raise WebSocketError("down")
             yield 5.0
 
-        def fake_poll(symbol, interval):
+        def fake_poll(*a, **kw):
             yield 1.0
             yield 2.0
 
@@ -649,13 +724,17 @@ class ReviewFixesTest(unittest.TestCase):
             return 100.3
 
         before = signal.getsignal(signal.SIGTERM)
+        before_int = signal.getsignal(signal.SIGINT)
         with tempfile.TemporaryDirectory() as t, contextlib.redirect_stdout(io.StringIO()):
             path = os.path.join(t, "s.json")
-            with mock.patch("gridbot.cli.fetch_price", side_effect=price), mock.patch("gridbot.cli.time.sleep"):
+            stack, _ = _patch_price(side_effect=price)
+            with stack, mock.patch("gridbot.data.time.sleep"):
                 self.assertEqual(main(PaperCliTest.ARGS + ["--state", path]), 0)
             e, _ = load_state(path)
-            self.assertAlmostEqual(e.last_price, 100.4)  # 收尾存檔把最後價格寫進去
+            # 訊號只設旗標:迴圈在安全點結束,收到訊號後送來的 100.3 不再處理;收尾存檔寫入 100.4
+            self.assertAlmostEqual(e.last_price, 100.4)
         self.assertEqual(signal.getsignal(signal.SIGTERM), before)
+        self.assertEqual(signal.getsignal(signal.SIGINT), before_int)
 
     # #7 警報指令不阻塞;結束時逾時會被砍掉
     def test_alert_nonblocking_and_flush_kills(self):
@@ -677,6 +756,211 @@ class ReviewFixesTest(unittest.TestCase):
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as cm:
                 main([cmd, "--csv", "a.csv", "--symbol", "ETHUSDT"])
             self.assertEqual(cm.exception.code, 2)
+
+
+class ExecutionModelTest(unittest.TestCase):
+    def test_touch_does_not_fill_cross_does(self):
+        e = GridEngine(cfg(), 100.5)  # 買 90/95/100、賣 110
+        self.assertEqual(e.on_price(100), [])  # 剛好碰到 100:不成交
+        self.assertEqual([f.price for f in e.on_price(99.9)], [100])  # 穿過才成交
+        self.assertEqual(e.on_price(105), [])  # 剛好碰到補上的 105 賣單:不成交
+        self.assertEqual([f.price for f in e.on_price(105.1)], [105])
+
+    def test_stop_loss_gap_fills_at_market_continuous_at_stop(self):
+        for gap, want in ((False, 80), (True, 70)):
+            e = GridEngine(cfg(stop_loss=80), 100.5)
+            fills = e.on_price(70, gap=gap)
+            self.assertEqual(fills[-1].note, "停損清倉")
+            self.assertEqual(fills[-1].price, want)
+        # 跳空出場的權益一定不優於連續出場
+        a, b = GridEngine(cfg(stop_loss=80), 100.5), GridEngine(cfg(stop_loss=80), 100.5)
+        a.on_price(70)
+        b.on_price(70, gap=True)
+        self.assertLess(b.equity(70), a.equity(70))
+
+    def test_fetch_klines_drops_forming_candle_and_backfills(self):
+        from unittest import mock
+        from urllib.parse import parse_qs, urlsplit
+        from gridbot import data
+        H = 3600_000
+        NOW = 10_000 * H  # 第 10000 根是形成中的那根
+        calls = []
+
+        def fake_get(url):  # 依 limit / endTime 回傳「到 endTime 為止」的最近 limit 根
+            q = parse_qs(urlsplit(url).query)
+            n = int(q["limit"][0])
+            end_idx = (int(q["endTime"][0]) // H) if "endTime" in q else NOW // H
+            calls.append(n)
+            return [[i * H, "1", "2", "0.5", str(i), "0", (i + 1) * H - 1] for i in range(end_idx - n + 1, end_idx + 1)]
+
+        with mock.patch.object(data, "_get", side_effect=fake_get):
+            k = data.fetch_klines("X", "1h", 3)
+        self.assertEqual([c[4] for c in k], [9997.0, 9998.0, 9999.0])  # 不含形成中的 10000
+        self.assertEqual(calls, [4])  # 多要一根,一次請求就夠
+
+        calls.clear()
+        with mock.patch.object(data, "_get", side_effect=fake_get):
+            k = data.fetch_klines("X", "1h", 1001)
+        self.assertEqual(len(k), 1001)
+        self.assertEqual(k[-1][4], 9999.0)
+        self.assertEqual([c[4] for c in k], [float(i) for i in range(8999, 10000)])  # 連續、無重複
+        self.assertEqual(calls, [1000, 2])
+
+
+class HelpTest(unittest.TestCase):
+    def test_every_subcommand_help_renders(self):
+        import contextlib, io
+        from gridbot.cli import main
+        for cmd in ("backtest", "sweep", "walkforward", "paper"):
+            with contextlib.redirect_stdout(io.StringIO()) as out, self.assertRaises(SystemExit) as cm:
+                main([cmd, "-h"])
+            self.assertEqual(cm.exception.code, 0, cmd)
+            self.assertIn("--", out.getvalue())
+
+
+class DeepReviewTest(unittest.TestCase):
+    # #1 金額大 / 價格極低時,最後一張單不能因浮點誤差被跳過
+    def test_large_invest_and_tiny_price_fill_every_order(self):
+        cases = [
+            (dict(lower=75000, upper=92000, grids=g, invest=inv, fee_rate=0.001, mode=m), start)
+            for g in (7, 20, 33) for inv in (1e4, 1e5, 1e6) for m in ("arithmetic", "geometric")
+            for start in (75001.3, 83443.8, 91999.9)
+        ] + [
+            (dict(lower=1e-5, upper=2e-5, grids=g, invest=inv, fee_rate=0.001, mode=m), 1.37e-5)
+            for g in (7, 20, 33) for inv in (1e3, 1e5) for m in ("arithmetic", "geometric")
+        ]
+        for kw, start in cases:
+            c = GridConfig(**kw)
+            e = GridEngine(c, start)
+            e.on_price(c.lower * 0.5)  # 跌穿下緣:所有買單都該成交
+            self.assertEqual(set(e.orders.values()), {"sell"}, (kw, start))
+            self.assertGreaterEqual(e.quote, 0)
+            e.on_price(c.upper * 2)  # 漲穿上緣:所有賣單都該成交
+            self.assertEqual(set(e.orders.values()), {"buy"}, (kw, start))
+            self.assertAlmostEqual(e.base, 0, delta=e.qty * 1e-6)
+            self.assertEqual(len(e.orders), c.grids)
+
+    # #16 端點精確,起始價貼著上緣也不會 StopIteration
+    def test_levels_endpoints_exact(self):
+        import math
+        for m in ("arithmetic", "geometric"):
+            for lo, hi, g in ((75000, 92000, 7), (0.1, 0.3, 33), (1e-5, 3e-5, 11)):
+                c = GridConfig(lo, hi, g, 1000, m)
+                lv = build_levels(c)
+                self.assertEqual((lv[0], lv[-1]), (lo, hi))
+                GridEngine(c, math.nextafter(hi, 0) if hasattr(math, "nextafter") else hi * (1 - 1e-15))
+
+    # #15 打平格距是 2f/(1-f),不是 2f
+    def test_breakeven_spacing(self):
+        from gridbot.engine import breakeven_spacing, spacing_covers_fees
+        f = 0.001
+        self.assertAlmostEqual(breakeven_spacing(f), 2 * f / (1 - f))
+        # 格距 0.2001%:大於 2f 但小於真正打平點 -> 不該視為足夠
+        c = GridConfig(100, 100 * 1.002001 ** 2, 2, 1000, "geometric", f)
+        self.assertFalse(spacing_covers_fees(c))
+        # 實際來回一次確實虧
+        e = GridEngine(c, 100.1)
+        e.on_price(99.99)
+        e.on_price(c.upper + 1)
+        self.assertLess(e.grid_profit, 0)
+
+    # #17 撮合中途有一張被跳過,不能覆蓋到它
+    def test_skipped_fill_aborts_round(self):
+        e = GridEngine(cfg(), 100.5)  # 買 90/95/100
+        orig = e._fill_buy
+        e._fill_buy = lambda i, ts: None if i == 2 else orig(i, ts)
+        self.assertEqual(e.on_price(94), [])
+        self.assertEqual(e.orders, {0: "buy", 1: "buy", 2: "buy", 4: "sell"})
+
+    # #11 回測:K 線之間跳空跌破停損,以開盤價出場而不是停損價
+    def test_backtest_gap_between_candles(self):
+        from gridbot.backtest import run_backtest
+        c = cfg(stop_loss=80)
+        gapped = [(0, 100.5, 101, 100.2, 100.5), (1, 70, 71, 69, 70)]
+        continuous = [(0, 100.5, 101, 100.2, 100.5), (1, 100.5, 101, 69, 70)]
+        g, k = run_backtest(c, gapped), run_backtest(c, continuous)
+        self.assertTrue(g.halted and k.halted)
+        self.assertLess(g.equity, k.equity)
+
+    # #3 / #13 CSV
+    def test_load_csv_strict(self):
+        import os, tempfile
+        from gridbot.data import load_csv
+
+        def load(text):
+            with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False) as fh:
+                fh.write(text)
+            self.addCleanup(os.unlink, fh.name)
+            return load_csv(fh.name)
+
+        ok = load("ts,open,high,low,close\n\n1700000000000,1,2,0.5,1.5\n\n1700000060000,1.5,2,1,1.2\n")
+        self.assertEqual([r[0] for r in ok], [1700000000.0, 1700000060.0])  # 空白行略過、毫秒轉秒
+        for bad in (
+            "ts,o,h,l,c\n1,1,2,0.5,1.5\nx,1,2,0.5,1.5\n",  # 中間的壞列不能被當標題略過
+            "1,1,2,0.5\n",  # 欄位不足
+            "1,1,2,nan,1.5\n",
+            "1,1,2,0.5,3\n",  # close > high
+            "2,1,2,0.5,1.5\n1,1,2,0.5,1.5\n",  # 時間倒退
+            "\n\n",
+        ):
+            with self.assertRaises(ValueError, msg=bad):
+                load(bad)
+
+    # #12 / #14 參數錯誤要在打網路之前就擋下
+    def test_validation_before_network(self):
+        import contextlib, io
+        from unittest import mock
+        from gridbot.cli import main
+        boom = mock.Mock(side_effect=AssertionError("不該打網路"))
+        with mock.patch("gridbot.cli.fetch_klines", boom), contextlib.redirect_stderr(io.StringIO()):
+            for argv in (["sweep", "--stop-loss-pct", "100"], ["sweep", "--fee", "0.5"], ["sweep", "--limit", "0"],
+                         ["walkforward", "--step", "0"], ["walkforward", "--train", "1"],
+                         ["backtest", "--symbol", "X", "--lower", "1", "--upper", "2", "--limit", "0"]):
+                self.assertEqual(main(argv), 2, argv)
+            self.assertEqual(main(["backtest", "--lower", "90", "--upper", "110", "--limit", "0"]), 2)
+        boom.assert_not_called()
+
+    # #4 第一次訊號只設旗標,第二次才強制中斷
+    def test_stop_flag(self):
+        import contextlib, io
+        from gridbot.cli import _StopFlag
+        f = _StopFlag()
+        with contextlib.redirect_stdout(io.StringIO()):
+            f(2, None)
+        self.assertTrue(f.requested)
+        with self.assertRaises(KeyboardInterrupt):
+            f(2, None)
+
+    # #7 輪詢的每一筆都標記跳空
+    def test_poll_ticks_marked_gap(self):
+        from unittest import mock
+        from gridbot.data import Tick, poll_prices
+        with mock.patch("gridbot.data.fetch_price", side_effect=[1.0, 2.0]), mock.patch("gridbot.data.time.sleep"):
+            g = poll_prices("X", 0.5)
+            got = [v for v in (next(g) for _ in range(4)) if v is not None]
+        self.assertEqual(got, [Tick(1.0, True), Tick(2.0, True)])
+
+    # #6 / #8 連線活著(ALIVE)但沒成交不算斷線;計時用 monotonic,牆上時鐘亂跳不影響
+    def test_alive_without_trades_is_not_outage(self):
+        import contextlib, io, os, tempfile
+        from unittest import mock
+        from gridbot import cli
+        from gridbot.data import ALIVE, Tick
+        ft = FakeTime()
+
+        def source(a):
+            for _ in range(40):  # 400 秒只有 ping,沒有成交(超過 stale-warn 30 與 stale-halt 300)
+                ft.now += 10
+                yield ALIVE
+            yield Tick(100.6, False)
+
+        with tempfile.TemporaryDirectory() as t, contextlib.redirect_stdout(io.StringIO()) as out, \
+                mock.patch.object(cli, "_price_source", source), mock.patch("gridbot.cli.time", ft):
+            stack, _ = _patch_price(return_value=100.5)
+            with stack:
+                rc = cli.main(PaperCliTest.ARGS + ["--state", os.path.join(t, "s.json"), "--max-polls", "1"])
+        self.assertEqual(rc, 0)
+        self.assertNotIn("沒有收到", out.getvalue())
 
 
 if __name__ == "__main__":

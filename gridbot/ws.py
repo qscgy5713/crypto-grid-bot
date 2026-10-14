@@ -33,7 +33,8 @@ class WebSocket:
         self.path = (u.path or "/") + (f"?{u.query}" if u.query else "")
         self.timeout = timeout
         self.sock: Optional[socket.socket] = None
-        self._buf = b""
+        self._buf = bytearray()
+        self._pos = 0  # _buf 中尚未讀取的起點;用偏移而非切片,避免每個 frame 複製整段緩衝
         self._parts: list = []  # 分片訊息的已收部分;跨 recv 呼叫保留,中途插入 ping 也不會遺失
         self.closed = False
 
@@ -60,7 +61,8 @@ class WebSocket:
                 head += chunk
                 if len(head) > 65536:
                     raise WebSocketError("握手回應過大")
-            head, self._buf = head.split(b"\r\n\r\n", 1)
+            head, rest = head.split(b"\r\n\r\n", 1)
+            self._buf, self._pos = bytearray(rest), 0
             lines = head.decode("latin-1").split("\r\n")
             if len(lines[0].split()) < 2 or lines[0].split()[1] != "101":
                 raise WebSocketError(f"握手失敗:{lines[0]}")
@@ -91,19 +93,23 @@ class WebSocket:
     # ---- 收發 ----
     def readable(self, timeout: float) -> bool:
         """最多等 timeout 秒,看有沒有資料可讀(含已緩衝 / TLS 已解密未取走的資料)。"""
-        if self._buf:
+        if len(self._buf) > self._pos:
             return True
         if self.tls and self.sock.pending():
             return True
         return bool(select.select([self.sock], [], [], timeout)[0])
 
     def _read_exact(self, n: int) -> bytes:
-        while len(self._buf) < n:
+        while len(self._buf) - self._pos < n:
             chunk = self.sock.recv(65536)
             if not chunk:
                 raise WebSocketError("連線中斷")
             self._buf += chunk
-        out, self._buf = self._buf[:n], self._buf[n:]
+        out = bytes(self._buf[self._pos:self._pos + n])
+        self._pos += n
+        if self._pos > 65536 and self._pos * 2 > len(self._buf):  # 偶爾壓縮已讀部分
+            del self._buf[:self._pos]
+            self._pos = 0
         return out
 
     def _send(self, opcode: int, payload: bytes = b"") -> None:

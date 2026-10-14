@@ -9,7 +9,7 @@ from typing import List, Optional, Sequence
 
 from .backtest import Result, run_backtest
 from .data import Candle
-from .engine import GridConfig, build_levels
+from .engine import GridConfig, min_spacing, spacing_covers_fees
 
 
 @dataclass
@@ -38,7 +38,9 @@ def split_candles(candles: List[Candle], split: float):
 
 
 def validate_params(grids_list: Sequence[int], pcts: Sequence[float], modes: Sequence[str],
-                    split: float, stop_loss_pct: Optional[float]) -> None:
+                    split: float, stop_loss_pct: Optional[float],
+                    invest: float = 1000.0, fee: float = 0.001) -> None:
+    """在下載資料前就驗完所有參數,避免白打網路才報錯。"""
     if not grids_list or not pcts or not modes:
         raise ValueError("格數、區間、模式清單都不可為空")
     if any(g < 2 for g in grids_list):
@@ -49,37 +51,43 @@ def validate_params(grids_list: Sequence[int], pcts: Sequence[float], modes: Seq
         raise ValueError("模式只能是 arithmetic / geometric")
     if not 0 < split <= 1:
         raise ValueError("split 需在 (0, 1] 之間")
-    if stop_loss_pct is not None and stop_loss_pct <= 0:
-        raise ValueError("stop-loss-pct 必須 > 0")
+    if stop_loss_pct is not None and not 0 < stop_loss_pct < 100:
+        raise ValueError("stop-loss-pct 需在 (0, 100) 之間")
+    if invest <= 0:
+        raise ValueError("invest 必須 > 0")
+    if not 0 <= fee < 0.05:
+        raise ValueError("fee 需在 [0, 0.05) 之間")
+
+
+def validate_walk_forward(train: int, test: int, step: Optional[int]) -> None:
+    if train < 2 or test < 2 or (step is not None and step < 1):
+        raise ValueError("train / test 至少 2 根,step 至少 1 根")
 
 
 def run_sweep(candles: List[Candle], grids_list: Sequence[int], pcts: Sequence[float],
               modes: Sequence[str], invest: float, fee: float, split: float = 0.7,
               stop_loss_pct: Optional[float] = None) -> List[Row]:
-    validate_params(grids_list, pcts, modes, split, stop_loss_pct)
+    validate_params(grids_list, pcts, modes, split, stop_loss_pct, invest, fee)
     seg_in, seg_out = split_candles(candles, split)
     rows: List[Row] = []
     for mode in modes:
         for pct in pcts:
             for g in grids_list:
                 cfg_in = _cfg(seg_in[0][1], g, pct, mode, invest, fee, stop_loss_pct)
-                lv = build_levels(cfg_in)
-                spacing = min(lv[i + 1] / lv[i] - 1 for i in range(len(lv) - 1))
-                if spacing <= fee * 2:
+                if not spacing_covers_fees(cfg_in):
                     continue  # 格距吃不過來回手續費,直接略過(價位線隨起始價等比縮放,樣本外格距%相同)
                 oos = None
                 if seg_out:
                     cfg_out = _cfg(seg_out[0][1], g, pct, mode, invest, fee, stop_loss_pct)
                     oos = run_backtest(cfg_out, seg_out)
-                rows.append(Row(g, pct, mode, spacing * 100, run_backtest(cfg_in, seg_in), oos))
+                rows.append(Row(g, pct, mode, min_spacing(cfg_in) * 100, run_backtest(cfg_in, seg_in), oos))
     return rows
 
 
 @dataclass
 class Fold:
     index: int
-    train_start: float  # ts
-    test_start: float
+    test_start: float  # ts
     test_end: float
     grids: int
     range_pct: float
@@ -95,10 +103,9 @@ def run_walk_forward(candles: List[Candle], grids_list: Sequence[int], pcts: Seq
 
     視窗每次前進 step 根(預設 = test,測試段彼此不重疊)。
     """
-    validate_params(grids_list, pcts, modes, 1.0, stop_loss_pct)
+    validate_params(grids_list, pcts, modes, 1.0, stop_loss_pct, invest, fee)
+    validate_walk_forward(train, test, step)
     step = test if step is None else step
-    if train < 2 or test < 2 or step < 1:
-        raise ValueError("train / test 至少 2 根,step 至少 1 根")
     if len(candles) < train + test:
         raise ValueError(f"資料 {len(candles)} 根不足以湊出一折(需 {train + test} 根)")
     folds: List[Fold] = []
@@ -111,8 +118,7 @@ def run_walk_forward(candles: List[Candle], grids_list: Sequence[int], pcts: Seq
             for pct in pcts:
                 for g in grids_list:
                     cfg = _cfg(seg_tr[0][1], g, pct, mode, invest, fee, stop_loss_pct)
-                    lv = build_levels(cfg)
-                    if min(lv[i + 1] / lv[i] - 1 for i in range(len(lv) - 1)) <= fee * 2:
+                    if not spacing_covers_fees(cfg):
                         continue
                     r = run_backtest(cfg, seg_tr)
                     if best is None or r.pnl_pct > best[0].pnl_pct:
@@ -121,7 +127,7 @@ def run_walk_forward(candles: List[Candle], grids_list: Sequence[int], pcts: Seq
             raise ValueError("所有組合的格距都不足以覆蓋手續費")
         r_tr, g, pct, mode = best
         r_te = run_backtest(_cfg(seg_te[0][1], g, pct, mode, invest, fee, stop_loss_pct), seg_te)
-        folds.append(Fold(len(folds) + 1, seg_tr[0][0], seg_te[0][0], seg_te[-1][0],
+        folds.append(Fold(len(folds) + 1, seg_te[0][0], seg_te[-1][0],
                           g, pct, mode, r_tr, r_te))
         s += step
     return folds

@@ -1,6 +1,19 @@
 # 工作日誌
 
 ## 2026-10-14
+- 深度 code review(xhigh,全專案)26 項全修,新增 10 個測試(共 57 個):
+  - 引擎:資金/持倉判斷改相對容差(舊版大金額 / 極低價會漏掉最後一張單,實測舊引擎 54 組中 37 組漏單);撮合中途有單被跳過即中止該輪(避免覆蓋);價位線端點精確(避免 StopIteration);打平格距改為 2f/(1-f) 並抽成共用函式;移除與 cycles 重複的 sell_count。
+  - 回測:K 線開盤價 ≠ 前收盤時視為跳空(停損以開盤價出場);Result 加 bars。
+  - 資料:load_csv 嚴格解析(空白行、標題、毫秒時間戳、壞列附列號報錯、NaN、價格合理性、時間順序);fetch_klines 直接丟第一頁最新一根(形成中),並多要一根,不依賴本機時鐘也不多打請求。
+  - 價格來源:改 yield `Tick(price, gap)` / `ALIVE` / `None`;跳空由來源標記(輪詢每筆、WS 連線後第一筆),取代固定 5 秒門檻;ping 等非成交訊息回報 ALIVE,冷門交易對不再誤判斷線;輪詢移到 data.py 並與 WS 共用 heartbeat_sleep;WS 連線逾時 5 秒,從輪詢回頭只探測一次。
+  - paper:SIGINT/SIGTERM 只設旗標、在安全點存檔結束,第二次 Ctrl+C 強制結束且不存半更新狀態;計時改 monotonic;`--interval` 下限 0.5 秒;`--stale-warn` 預設 30(ws 模式須 > 10);sweep / walkforward / backtest 所有參數在打網路前驗完。
+  - 測試:FakeWsServer 握手中途斷線不再空轉、改 addCleanup;警報順序不再假設;新增可控時鐘 FakeTime。
+  - 文件:plan.md 更新到現況(review 指出長期未更新)。
+- 真實環境驗證:WS / 輪詢、SIGINT 安全結束後接續一致、backtest / sweep / walkforward 皆正常。
+- 先前自查:停損跳空、穿價成交、排除未收盤 K 線;README 補完整參數說明;修 `sweep -h` 崩潰。
+- README 改寫:新增「參數說明」(各子指令完整參數表、預設值、怎麼選 / 怎麼讀)、退出碼、執行模型(穿價成交、跳空停損)。所有 CLI 參數補上 help 文字,與 README 一致。
+- 修 bug:`sweep -h` 崩潰(help 字串含未跳脫的 `%`,argparse 視為格式符號);新增「每個子指令 -h 都能顯示」測試。
+- 執行模型修正(自查):停損遇跳空改以當下價格出場(`on_price(gap=True)`:接續、兩筆價格相隔 >5 秒)、成交改為穿價才算、`fetch_klines` 排除未收盤 K 線並自動補足數量。新增 3 個測試。
 - code review(第二輪,涵蓋 sweep / walkforward / 持久化 / WebSocket / 斷線警報)9 項全修:
   1. `--interval` 必須小於 `--stale-warn`(否則輪詢本身觸發誤報 / 提前停機)。
   2. 接續時價格已跌破停損 → 清倉存檔後直接結束,不再進價格迴圈空等。
