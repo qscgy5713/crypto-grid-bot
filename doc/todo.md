@@ -5,7 +5,16 @@
 - [x] 資料來源(CSV、Binance 公開 API、合成資料)
 - [x] 模擬盤
 - [x] 單元測試(含「恰 grids 張單、持倉=賣單數×每格量」不變量)
-- [ ] 模擬盤狀態持久化(重啟後還原掛單與資金)
+- [x] 模擬盤狀態持久化(重啟後還原掛單與資金)
+- [x] 狀態檔鎖定(flock;Windows 無 fcntl 時不加鎖)
+- [ ] 停機期間用歷史 K 線補齊成交,取代目前的直線近似
 - [ ] 實盤交易所 adapter(ccxt;限價單、對帳、部分成交、API 錯誤重試)
+- [x] WebSocket 即時價格(`paper --source ws`,自寫標準庫客戶端、斷線重連、連不上退回輪詢)
+- [x] 斷線警報與自動停機(Watchdog、心跳、--alert-cmd)
+- [ ] 內建 Telegram / Email 通知(目前靠 --alert-cmd 自行串接)
+- [ ] WebSocket 重連期間漏掉的價格,用 REST 近期成交/K 線補齊
 - [ ] 回測輸出權益曲線 CSV / 圖表
-- [ ] 參數掃描(格數、區間)
+- [x] 參數掃描(格數、區間寬度、模式;樣本內 / 樣本外切分)
+- [x] 滾動視窗(walk-forward)驗證 `walkforward`
+- [ ] 多交易對 / 更長歷史(跨牛熊)的 walk-forward
+- [ ] walk-forward 加固定參數基準線對照

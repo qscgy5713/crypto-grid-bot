@@ -43,7 +43,6 @@ def run_backtest(cfg: GridConfig, candles: List[Candle]) -> Result:
             max_dd = max(max_dd, (peak - eq) / peak)
     end = candles[-1][4]
     eq = eng.equity(end)
-    real = [f for f in eng.fills if f.level >= 0]
     return Result(
         start_price=first[1],
         end_price=end,
@@ -52,8 +51,8 @@ def run_backtest(cfg: GridConfig, candles: List[Candle]) -> Result:
         pnl_pct=(eq / cfg.invest - 1) * 100,
         hold_pnl_pct=(end / first[1] - 1) * 100,
         max_drawdown_pct=max_dd * 100,
-        buys=sum(1 for f in real if f.side == "buy"),
-        sells=sum(1 for f in real if f.side == "sell"),
+        buys=eng.buy_count,
+        sells=eng.sell_count,
         cycles=eng.cycles,
         grid_profit=eng.grid_profit,
         base=eng.base,

@@ -8,10 +8,13 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+import math
+from dataclasses import asdict, dataclass
 from typing import Dict, List, Optional
 
 EPS = 1e-12
+STATE_VERSION = 1
+MAX_SAVED_FILLS = 1000  # 存檔只保留最近的成交紀錄;cycles / grid_profit 另存,不受影響
 
 
 @dataclass
@@ -70,6 +73,8 @@ class GridEngine:
         self.halted = False
         self.fills: List[Fill] = []
         self.cycles = 0  # 已完成的「買->賣」套利次數
+        self.buy_count = 0  # 網格買單成交次數(不含初始建倉)
+        self.sell_count = 0
         self.grid_profit = 0.0  # 網格套利利潤(估算,已扣手續費)
         # level index -> "buy" | "sell"
         self.orders: Dict[int, str] = {}
@@ -99,9 +104,21 @@ class GridEngine:
         for i in sells:
             self.orders[i] = "sell"
 
+    def _record(self, f: Fill) -> None:
+        """記錄成交;記憶體只保留最近一段(統計另有計數器),避免長時間運行無限成長。"""
+        self.fills.append(f)
+        if len(self.fills) > 2 * MAX_SAVED_FILLS:
+            del self.fills[:-MAX_SAVED_FILLS]
+
     # ---- 查詢 ----
     def equity(self, price: float) -> float:
         return self.quote + self.base * price
+
+    def next_orders(self):
+        """(最近買單價, 最近賣單價);沒有則為 None。"""
+        buys = [self.levels[i] for i, s in self.orders.items() if s == "buy"]
+        sells = [self.levels[i] for i, s in self.orders.items() if s == "sell"]
+        return (max(buys) if buys else None, min(sells) if sells else None)
 
     # ---- 驅動 ----
     def on_price(self, price: float, ts: float = 0.0) -> List[Fill]:
@@ -151,7 +168,8 @@ class GridEngine:
         self.base += self.qty
         self.orders[i + 1] = "sell"
         f = Fill(ts, "buy", i, p, self.qty, fee)
-        self.fills.append(f)
+        self.buy_count += 1
+        self._record(f)
         return f
 
     def _fill_sell(self, i: int, ts: float) -> Optional[Fill]:
@@ -167,7 +185,8 @@ class GridEngine:
         self.cycles += 1
         self.grid_profit += self.qty * (p - self.levels[i - 1]) - fee - self.qty * self.levels[i - 1] * self.cfg.fee_rate
         f = Fill(ts, "sell", i, p, self.qty, fee)
-        self.fills.append(f)
+        self.sell_count += 1
+        self._record(f)
         return f
 
     def _stop_out(self, price: float, ts: float) -> Fill:
@@ -179,5 +198,61 @@ class GridEngine:
         self.orders.clear()
         self.halted = True
         f = Fill(ts, "sell", -1, price, qty, fee, "停損清倉")
-        self.fills.append(f)
+        self._record(f)
         return f
+
+    # ---- 持久化 ----
+    def to_dict(self) -> dict:
+        return {
+            "version": STATE_VERSION,
+            "cfg": asdict(self.cfg),
+            "qty": self.qty,
+            "quote": self.quote,
+            "base": self.base,
+            "last_price": self.last_price,
+            "halted": self.halted,
+            "cycles": self.cycles,
+            "grid_profit": self.grid_profit,
+            "buy_count": self.buy_count,
+            "sell_count": self.sell_count,
+            "orders": {str(i): s for i, s in self.orders.items()},
+            "fills": [asdict(f) for f in self.fills[-MAX_SAVED_FILLS:]],
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "GridEngine":
+        """還原引擎狀態;資料缺漏或內部不一致(被改壞、版本不符)一律丟 ValueError。"""
+        try:
+            if d["version"] != STATE_VERSION:
+                raise ValueError(f"不支援的狀態版本 {d['version']}")
+            cfg = GridConfig(**d["cfg"])
+            cfg.validate()
+            e = object.__new__(cls)
+            e.cfg = cfg
+            e.levels = build_levels(cfg)
+            e.qty = float(d["qty"])
+            e.quote = float(d["quote"])
+            e.base = float(d["base"])
+            e.last_price = float(d["last_price"])
+            e.halted = bool(d["halted"])
+            e.cycles = int(d["cycles"])
+            e.grid_profit = float(d["grid_profit"])
+            e.buy_count = int(d.get("buy_count", 0))
+            e.sell_count = int(d.get("sell_count", 0))
+            e.orders = {int(i): s for i, s in d["orders"].items()}
+            e.fills = [Fill(**f) for f in d["fills"]]
+        except (KeyError, TypeError, AttributeError) as ex:
+            raise ValueError(f"狀態檔格式錯誤:{ex!r}") from ex
+        nums = (e.qty, e.quote, e.base, e.last_price, e.grid_profit)
+        if not all(math.isfinite(x) for x in nums) or e.qty <= 0 or e.last_price <= 0:
+            raise ValueError("狀態檔數值異常")
+        if e.quote < -1e-6 or e.base < -1e-9:
+            raise ValueError("狀態檔餘額為負")
+        n = len(e.levels)
+        if any(not (0 <= i < n) or s not in ("buy", "sell") for i, s in e.orders.items()):
+            raise ValueError("狀態檔掛單異常")
+        if not e.halted:
+            sells = sum(1 for s in e.orders.values() if s == "sell")
+            if len(e.orders) != cfg.grids or abs(e.base - sells * e.qty) > 1e-6 * max(1.0, e.base):
+                raise ValueError("狀態檔不一致:掛單數或持倉與賣單不符")
+        return e
